@@ -1,6 +1,0 @@
-.venv/
-.idea/
-cat_captures/
-cat_videos/
-__pycache__/
-*.pyc
