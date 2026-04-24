@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <Arduino.h>
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
@@ -19,6 +20,29 @@
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "camera_index.h"
+
+extern volatile int latestMq135;
+extern volatile int latestMq136;
+extern String latestRfidHex;
+extern String latestRfidCard;
+extern unsigned long latestRfidTime;
+extern volatile bool rfidSessionActive;
+extern String activeRfidHex;
+extern String activeRfidCard;
+extern unsigned long activeSessionStartTime;
+extern String latestRfidEvent;
+extern String latestSessionStatus;
+extern unsigned long latestSessionDurationMs;
+extern unsigned long latestSessionStartTime;
+extern unsigned long latestSessionEndTime;
+extern unsigned long completedSessionCount;
+extern unsigned long falseEntryCount;
+extern unsigned long noExitTimeoutCount;
+extern const int mq135ActiveLevel;
+extern const int mq136ActiveLevel;
+extern const unsigned long normalSessionMinMs;
+extern const unsigned long normalSessionMaxMs;
+extern const unsigned long noExitTimeoutMs;
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -1202,6 +1226,95 @@ static esp_err_t index_handler(httpd_req_t *req)
     }
 }
 
+static esp_err_t sensors_handler(httpd_req_t *req)
+{
+    char json_response[1024];
+
+    int mq135Raw = latestMq135;
+    int mq136Raw = latestMq136;
+    String rfidHex = latestRfidHex;
+    String rfidCard = latestRfidCard;
+    unsigned long rfidTime = latestRfidTime;
+    bool sessionActive = rfidSessionActive;
+    String activeHex = activeRfidHex;
+    String activeCard = activeRfidCard;
+    unsigned long sessionStart = activeSessionStartTime;
+    String rfidEvent = latestRfidEvent;
+    String sessionStatus = latestSessionStatus;
+    unsigned long sessionDuration = latestSessionDurationMs;
+    unsigned long sessionEnd = latestSessionEndTime;
+    unsigned long sessionCount = completedSessionCount;
+    unsigned long ignoredFalseEntries = falseEntryCount;
+    unsigned long timeoutCount = noExitTimeoutCount;
+    unsigned long activeDuration = sessionActive ? millis() - sessionStart : 0;
+    const char* currentSessionStatus = "IDLE";
+
+    if (sessionActive) {
+        if (activeDuration >= noExitTimeoutMs) {
+            currentSessionStatus = "NO_EXIT_TIMEOUT";
+        } else if (activeDuration >= normalSessionMaxMs) {
+            currentSessionStatus = "ABNORMAL_IN_PROGRESS";
+        } else if (activeDuration >= normalSessionMinMs) {
+            currentSessionStatus = "NORMAL_WINDOW";
+        } else {
+            currentSessionStatus = "IN_PROGRESS";
+        }
+    }
+
+    snprintf(
+        json_response,
+        sizeof(json_response),
+        "{"
+        "\"mq135\":\"%s\","
+        "\"mq136\":\"%s\","
+        "\"mq135Raw\":%d,"
+        "\"mq136Raw\":%d,"
+        "\"rfidHex\":\"%s\","
+        "\"rfidCard\":\"%s\","
+        "\"lastRfidMs\":%lu,"
+        "\"rfidEvent\":\"%s\","
+        "\"sessionActive\":%s,"
+        "\"activeRfidHex\":\"%s\","
+        "\"activeRfidCard\":\"%s\","
+        "\"activeSessionStartMs\":%lu,"
+        "\"activeSessionDurationMs\":%lu,"
+        "\"currentSessionStatus\":\"%s\","
+        "\"lastSessionStatus\":\"%s\","
+        "\"lastSessionDurationMs\":%lu,"
+        "\"lastSessionEndMs\":%lu,"
+        "\"completedSessionCount\":%lu,"
+        "\"falseEntryCount\":%lu,"
+        "\"noExitTimeoutCount\":%lu,"
+        "\"noExitTimeoutMs\":%lu"
+        "}",
+        mq135Raw == mq135ActiveLevel ? "GAS DETECTED" : "Clear",
+        mq136Raw == mq136ActiveLevel ? "GAS DETECTED" : "Clear",
+        mq135Raw,
+        mq136Raw,
+        rfidHex.c_str(),
+        rfidCard.c_str(),
+        rfidTime,
+        rfidEvent.c_str(),
+        sessionActive ? "true" : "false",
+        activeHex.c_str(),
+        activeCard.c_str(),
+        sessionStart,
+        activeDuration,
+        currentSessionStatus,
+        sessionStatus.c_str(),
+        sessionDuration,
+        sessionEnd,
+        sessionCount,
+        ignoredFalseEntries,
+        timeoutCount,
+        noExitTimeoutMs
+    );
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json_response, strlen(json_response));
+}
+
 void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -1224,6 +1337,19 @@ void startCameraServer()
         .uri = "/status",
         .method = HTTP_GET,
         .handler = status_handler,
+        .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+        ,
+        .is_websocket = true,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = NULL
+#endif
+    };
+
+    httpd_uri_t sensors_uri = {
+        .uri = "/sensors",
+        .method = HTTP_GET,
+        .handler = sensors_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
         ,
@@ -1364,6 +1490,7 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &index_uri);
         httpd_register_uri_handler(camera_httpd, &cmd_uri);
         httpd_register_uri_handler(camera_httpd, &status_uri);
+        httpd_register_uri_handler(camera_httpd, &sensors_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
         httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
