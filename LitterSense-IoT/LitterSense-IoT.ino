@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include "soc/rtc_cntl_reg.h"
 
@@ -31,17 +33,26 @@
 // WiFi provisioning
 // ===========================
 Preferences prefs;
+WebServer setupServer(80);
+DNSServer setupDns;
 
-const char* bootstrapSsid = "AUSTRIAWIFI";
-const char* bootstrapPassword = "Joshuaaustria_19";
-const char* deviceConfigUrl = "http://192.168.68.106:3000/api/device-config/cfg_3dc4b4f1bbc6491c898aafa1cc2ae2a7";
+const char* setupApBaseSsid = "LitterSense-Setup";
+const char* setupApPassword = "littersense";
+const char* defaultDeviceConfigUrl = "";
 
 const char* wifiPrefsNamespace = "wifi_cfg";
 const char* wifiPrefsSsidKey = "ssid";
 const char* wifiPrefsPassKey = "pass";
+const char* wifiPrefsConfigUrlKey = "config_url";
+const byte SETUP_DNS_PORT = 53;
+const unsigned long CLOUD_CONFIG_SYNC_INTERVAL_MS = 300000UL;
 // Default to DHCP so the device can join arbitrary owner networks.
 // Set this to true only if you want a fixed IP and have matched the values below to that router.
 const bool useStaticIpForTargetWifi = false;
+// Keep true while testing owner setup. Set to false after the first successful hardware test.
+const bool forceSetupPortalOnBoot = false;
+// Keep false on ESP32-CAM unless you have a very stable supply. GPIO 4 drives the bright flash LED.
+const bool useFlashLedStatusIndicator = false;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000UL;
 
 // Optional static address for the owner Wi-Fi network.
@@ -51,6 +62,8 @@ IPAddress gateway(192, 168, 68, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDns(8, 8, 8, 8);
 IPAddress secondaryDns(8, 8, 4, 4);
+IPAddress setupApIp(192, 168, 4, 1);
+IPAddress setupApSubnet(255, 255, 255, 0);
 
 // ===========================
 // Your wiring
@@ -66,6 +79,8 @@ IPAddress secondaryDns(8, 8, 4, 4);
 #define MQ136_ACTIVE_LEVEL LOW
 #define GAS_REPORT_INTERVAL_MS 60000UL
 #define RFID_PASS_DEBOUNCE_MS 5000UL
+#define RFID_MAX_BYTES_PER_LOOP 32
+#define RFID_DEBUG_RAW_BYTES false
 #define FALSE_ENTER_MAX_MS 30000UL
 #define NORMAL_SESSION_MIN_MS 120000UL
 #define NORMAL_SESSION_MAX_MS 180000UL
@@ -98,6 +113,14 @@ unsigned long falseEntryCount = 0;
 unsigned long noExitTimeoutCount = 0;
 bool cameraReady = false;
 bool cameraServerStarted = false;
+bool setupPortalShouldStop = false;
+bool setupPortalProvisioned = false;
+String activeSetupApSsid = "";
+bool setupPortalHasPendingCredentials = false;
+String pendingSetupSsid = "";
+String pendingSetupPassword = "";
+String pendingSetupConfigUrl = "";
+unsigned long lastCloudConfigSync = 0;
 extern const int mq135ActiveLevel = MQ135_ACTIVE_LEVEL;
 extern const int mq136ActiveLevel = MQ136_ACTIVE_LEVEL;
 extern const unsigned long falseEnterMaxMs = FALSE_ENTER_MAX_MS;
@@ -109,13 +132,57 @@ void startCameraServer();
 void setupLedFlash(int pin);
 void sensorTask(void* pvParameters);
 
-bool isBootstrapWifiConfigured() {
-  return String(bootstrapSsid).length() > 0 &&
-         String(bootstrapSsid) != "YOUR_BOOTSTRAP_WIFI";
+void setupStatusLed() {
+#if defined(LED_GPIO_NUM)
+  if (!useFlashLedStatusIndicator) {
+    return;
+  }
+  pinMode(LED_GPIO_NUM, OUTPUT);
+  digitalWrite(LED_GPIO_NUM, LOW);
+#endif
 }
 
-bool isProvisioningUrlConfigured() {
-  String url(deviceConfigUrl);
+void setStatusLed(bool isOn) {
+#if defined(LED_GPIO_NUM)
+  if (!useFlashLedStatusIndicator) {
+    return;
+  }
+  digitalWrite(LED_GPIO_NUM, isOn ? HIGH : LOW);
+#endif
+}
+
+void blinkStatusLed(int count, unsigned long intervalMs) {
+#if defined(LED_GPIO_NUM)
+  if (!useFlashLedStatusIndicator) {
+    return;
+  }
+  for (int i = 0; i < count; i++) {
+    setStatusLed(true);
+    delay(intervalMs);
+    setStatusLed(false);
+    delay(intervalMs);
+  }
+#endif
+}
+
+void updateSetupPortalIndicator() {
+#if defined(LED_GPIO_NUM)
+  static unsigned long lastToggleMs = 0;
+  static bool isOn = false;
+
+  unsigned long now = millis();
+  if (now - lastToggleMs >= 500UL) {
+    lastToggleMs = now;
+    isOn = !isOn;
+    setStatusLed(isOn);
+  }
+#endif
+}
+
+bool isProvisioningUrlConfigured(const String& configUrl) {
+  String url = configUrl;
+  url.trim();
+
   return url.length() > 0 &&
          url != "http://YOUR_PC_IP:3000/api/device-config/cfg_xxxxxxxxxxxxxxxx" &&
          !url.startsWith("http://localhost") &&
@@ -125,17 +192,13 @@ bool isProvisioningUrlConfigured() {
 }
 
 void printProvisioningRequirements() {
-  if (!isBootstrapWifiConfigured()) {
-    Serial.println("Bootstrap Wi-Fi is not configured yet.");
-    Serial.println("Set bootstrapSsid and bootstrapPassword in the sketch for first-time setup.");
-  }
-
-  if (!isProvisioningUrlConfigured()) {
-    Serial.println("deviceConfigUrl is not reachable from the ESP32.");
-    Serial.println("Use your computer LAN IP or a deployed HTTPS URL, never localhost.");
-    Serial.print("Current deviceConfigUrl: ");
-    Serial.println(deviceConfigUrl);
-  }
+  Serial.println("Wi-Fi setup is owner-ready: no owner SSID/password is hardcoded.");
+  Serial.println("If no saved Wi-Fi works, the ESP32 creates a setup network.");
+  Serial.print("Setup network base name: ");
+  Serial.println(setupApBaseSsid);
+  Serial.print("Setup network password: ");
+  Serial.println(setupApPassword);
+  Serial.println("Setup page: http://192.168.4.1");
 }
 
 bool configureWifiNetwork(bool useStaticIp) {
@@ -159,9 +222,11 @@ bool connectWifi(
     return false;
   }
 
-  WiFi.mode(WIFI_STA);
+  wifi_mode_t currentMode = WiFi.getMode();
+  WiFi.mode(currentMode == WIFI_AP || currentMode == WIFI_AP_STA ? WIFI_AP_STA : WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.disconnect(true, true);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  WiFi.disconnect(false, true);
   delay(200);
 
   if (!configureWifiNetwork(useStaticIp)) {
@@ -194,7 +259,9 @@ bool connectWifi(
   Serial.println();
   Serial.print(label);
   Serial.println(" Wi-Fi failed.");
-  WiFi.disconnect(true, true);
+  wifi_mode_t modeAfterFailure = WiFi.getMode();
+  bool keepSetupApRunning = modeAfterFailure == WIFI_AP || modeAfterFailure == WIFI_AP_STA;
+  WiFi.disconnect(!keepSetupApRunning, true);
   delay(200);
   return false;
 }
@@ -212,6 +279,27 @@ bool loadWifiConfig(String& ssid, String& password) {
   password = prefs.getString(wifiPrefsPassKey, "");
   prefs.end();
   return ssid.length() > 0;
+}
+
+void saveDeviceConfigUrl(const String& configUrl) {
+  String trimmedUrl = configUrl;
+  trimmedUrl.trim();
+
+  prefs.begin(wifiPrefsNamespace, false);
+  if (trimmedUrl.length() > 0) {
+    prefs.putString(wifiPrefsConfigUrlKey, trimmedUrl);
+  } else {
+    prefs.remove(wifiPrefsConfigUrlKey);
+  }
+  prefs.end();
+}
+
+bool loadDeviceConfigUrl(String& configUrl) {
+  prefs.begin(wifiPrefsNamespace, true);
+  configUrl = prefs.getString(wifiPrefsConfigUrlKey, defaultDeviceConfigUrl);
+  prefs.end();
+  configUrl.trim();
+  return isProvisioningUrlConfigured(configUrl);
 }
 
 bool extractJsonStringField(const String& json, const char* key, String& value) {
@@ -294,6 +382,136 @@ bool extractJsonStringField(const String& json, const char* key, String& value) 
   return false;
 }
 
+String htmlEscape(String value) {
+  value.replace("&", "&amp;");
+  value.replace("\"", "&quot;");
+  value.replace("<", "&lt;");
+  value.replace(">", "&gt;");
+  return value;
+}
+
+String makeSetupSsid() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+
+  if (mac.length() >= 4) {
+    return String(setupApBaseSsid) + "-" + mac.substring(mac.length() - 4);
+  }
+
+  return String(setupApBaseSsid);
+}
+
+void sendSetupCorsHeaders() {
+  setupServer.sendHeader("Access-Control-Allow-Origin", "*");
+  setupServer.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  setupServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void sendSetupPage(const String& message = "", bool success = false) {
+  String savedUrl;
+  loadDeviceConfigUrl(savedUrl);
+
+  String html = F(
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>LitterSense Wi-Fi Setup</title>"
+    "<style>"
+    "body{font-family:Arial,sans-serif;margin:0;background:#f5f2eb;color:#1f2933;}"
+    "main{max-width:440px;margin:0 auto;padding:24px 16px;}"
+    ".card{background:#fff;border:1px solid #ddd7cc;border-radius:12px;padding:18px;box-shadow:0 8px 24px rgba(31,41,51,.08);}"
+    "h1{font-size:24px;margin:0 0 8px;}p{font-size:14px;line-height:1.45;color:#52606d;}"
+    "label{display:block;font-size:13px;font-weight:700;margin:14px 0 6px;}"
+    "input{box-sizing:border-box;width:100%;border:1px solid #c8c1b5;border-radius:10px;padding:12px;font-size:16px;}"
+    "button{width:100%;border:0;border-radius:10px;background:#1e6b5e;color:#fff;font-weight:700;font-size:16px;padding:13px;margin-top:18px;}"
+    ".msg{border-radius:10px;padding:10px 12px;margin:12px 0;font-size:14px;}"
+    ".ok{background:#e6f4ea;color:#17603a;}.err{background:#fdecea;color:#a1281f;}"
+    ".hint{font-size:12px;color:#697586;word-break:break-word;}"
+    "</style></head><body><main><div class='card'>"
+    "<h1>LitterSense Wi-Fi Setup</h1>"
+    "<p>Connect this device to the owner's Wi-Fi. Credentials are saved in the ESP32 flash, not in the Arduino sketch.</p>"
+  );
+
+  if (message.length() > 0) {
+    html += "<div class='msg ";
+    html += success ? "ok" : "err";
+    html += "'>";
+    html += htmlEscape(message);
+    html += "</div>";
+  }
+
+  html += F(
+    "<form method='post' action='/provision'>"
+    "<label for='ssid'>Wi-Fi Name (SSID)</label>"
+    "<input id='ssid' name='ssid' autocomplete='off' required>"
+    "<label for='password'>Wi-Fi Password</label>"
+    "<input id='password' name='password' type='password' autocomplete='current-password'>"
+    "<label for='configUrl'>Device Fetch URL from the web app</label>"
+    "<input id='configUrl' name='configUrl' placeholder='https://.../api/device-config/cfg_...'"
+  );
+  html += " value='" + htmlEscape(savedUrl) + "'>";
+  html += F(
+    "<p class='hint'>Optional for first connection, required for future Wi-Fi changes from Settings to sync automatically.</p>"
+    "<button type='submit'>Save and Connect</button>"
+    "</form>"
+    "<p class='hint'>Setup network: "
+  );
+  html += htmlEscape(activeSetupApSsid);
+  html += F(" / password: ");
+  html += htmlEscape(setupApPassword);
+  html += F("</p></div></main></body></html>");
+
+  sendSetupCorsHeaders();
+  setupServer.send(200, "text/html", html);
+}
+
+String readSetupArg(const char* key) {
+  if (setupServer.hasArg(key)) {
+    return setupServer.arg(key);
+  }
+
+  String body = setupServer.arg("plain");
+  String value;
+  if (body.length() > 0 && extractJsonStringField(body, key, value)) {
+    return value;
+  }
+
+  return "";
+}
+
+void handleSetupStatus() {
+  String response = "{";
+  response += "\"setup\":true,";
+  response += "\"connected\":";
+  response += (WiFi.status() == WL_CONNECTED ? "true" : "false");
+  response += ",\"ip\":\"";
+  response += (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "");
+  response += "\",\"setupSsid\":\"";
+  response += activeSetupApSsid;
+  response += "\"}";
+
+  sendSetupCorsHeaders();
+  setupServer.send(200, "application/json", response);
+}
+
+void handleSetupHealth() {
+  String response = "LitterSense setup portal is running\n";
+  response += "AP SSID: ";
+  response += activeSetupApSsid;
+  response += "\nAP IP: ";
+  response += WiFi.softAPIP().toString();
+  response += "\nClients: ";
+  response += String(WiFi.softAPgetStationNum());
+  response += "\n";
+
+  sendSetupCorsHeaders();
+  setupServer.send(200, "text/plain", response);
+}
+
+void redirectToSetupPage() {
+  setupServer.sendHeader("Location", "http://192.168.4.1/", true);
+  setupServer.send(302, "text/plain", "");
+}
+
 template <typename TClient>
 bool fetchWifiConfigWithClient(
   TClient& client,
@@ -341,14 +559,18 @@ bool fetchWifiConfigWithClient(
   return ssid.length() > 0;
 }
 
-bool fetchWifiConfig(String& ssid, String& password, String& deviceName) {
-  if (!isProvisioningUrlConfigured()) {
-    Serial.println("Set deviceConfigUrl to the Settings > Device Network URL first.");
-    Serial.println("Replace localhost with your computer LAN IP, e.g. http://192.168.1.10:3000/...");
+bool fetchWifiConfigFromUrl(
+  const String& configUrl,
+  String& ssid,
+  String& password,
+  String& deviceName
+) {
+  if (!isProvisioningUrlConfigured(configUrl)) {
+    Serial.println("Device config URL is missing or not reachable from the ESP32.");
+    Serial.println("Paste Settings > Device Fetch URL into the setup portal.");
     return false;
   }
 
-  String configUrl(deviceConfigUrl);
   Serial.print("Fetching Wi-Fi config from ");
   Serial.println(configUrl);
 
@@ -360,6 +582,16 @@ bool fetchWifiConfig(String& ssid, String& password, String& deviceName) {
 
   WiFiClient client;
   return fetchWifiConfigWithClient(client, configUrl, ssid, password, deviceName);
+}
+
+bool fetchWifiConfig(String& ssid, String& password, String& deviceName) {
+  String configUrl;
+  if (!loadDeviceConfigUrl(configUrl)) {
+    Serial.println("No stored Device Fetch URL. Cloud Wi-Fi sync is disabled.");
+    return false;
+  }
+
+  return fetchWifiConfigFromUrl(configUrl, ssid, password, deviceName);
 }
 
 void ensureCameraServerStarted() {
@@ -375,40 +607,203 @@ void ensureCameraServerStarted() {
   }
 }
 
-bool provisionWifiFromBootstrap() {
-  if (!isBootstrapWifiConfigured()) {
-    printProvisioningRequirements();
+bool syncWifiConfigFromCloud(bool reconnectIfChanged) {
+  String configUrl;
+  if (!loadDeviceConfigUrl(configUrl)) {
     return false;
   }
 
-  if (!connectWifi(String(bootstrapSsid), String(bootstrapPassword), false, "bootstrap")) {
-    Serial.println("Bootstrap Wi-Fi failed.");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Skipping cloud Wi-Fi sync because the device is offline.");
     return false;
   }
 
   String fetchedSsid;
   String fetchedPassword;
   String fetchedDeviceName;
-  if (!fetchWifiConfig(fetchedSsid, fetchedPassword, fetchedDeviceName)) {
-    Serial.println("Failed to fetch Wi-Fi config.");
+  if (!fetchWifiConfigFromUrl(configUrl, fetchedSsid, fetchedPassword, fetchedDeviceName)) {
+    Serial.println("Cloud Wi-Fi sync failed; keeping the current saved config.");
     return false;
   }
 
-  saveWifiConfig(fetchedSsid, fetchedPassword);
+  String savedSsid;
+  String savedPassword;
+  loadWifiConfig(savedSsid, savedPassword);
 
-  Serial.print("Fetched config for device: ");
+  Serial.print("Cloud config belongs to device: ");
   Serial.println(fetchedDeviceName.length() > 0 ? fetchedDeviceName : "(unnamed)");
 
-  WiFi.disconnect(true, true);
-  delay(1000);
-
-  if (connectWifi(fetchedSsid, fetchedPassword, useStaticIpForTargetWifi, "provisioned")) {
-    Serial.println("Connected using fetched Wi-Fi config.");
+  if (fetchedSsid == savedSsid && fetchedPassword == savedPassword) {
+    Serial.println("Cloud Wi-Fi config matches saved config.");
     return true;
   }
 
-  Serial.println("Fetched config, but target Wi-Fi connection failed.");
+  Serial.println("Cloud Wi-Fi config changed.");
+
+  if (!reconnectIfChanged) {
+    saveWifiConfig(fetchedSsid, fetchedPassword);
+    return true;
+  }
+
+  if (connectWifi(fetchedSsid, fetchedPassword, useStaticIpForTargetWifi, "cloud")) {
+    saveWifiConfig(fetchedSsid, fetchedPassword);
+    Serial.println("Connected with cloud-synced Wi-Fi config.");
+    return true;
+  }
+
+  Serial.println("Cloud Wi-Fi config failed. Restoring previous saved connection.");
+  if (savedSsid.length() > 0) {
+    connectWifi(savedSsid, savedPassword, useStaticIpForTargetWifi, "previous saved");
+  }
   return false;
+}
+
+void handleSetupProvision() {
+  String ssid = readSetupArg("ssid");
+  String password = readSetupArg("password");
+  String configUrl = readSetupArg("configUrl");
+
+  ssid.trim();
+  password.trim();
+  configUrl.trim();
+
+  if (ssid.length() == 0) {
+    sendSetupPage("Enter the owner's Wi-Fi name.", false);
+    return;
+  }
+
+  if (configUrl.length() > 0 && !isProvisioningUrlConfigured(configUrl)) {
+    sendSetupPage("Use a real Device Fetch URL. localhost and 127.0.0.1 do not work from the ESP32.", false);
+    return;
+  }
+
+  Serial.print("Setup portal received Wi-Fi SSID: ");
+  Serial.println(ssid);
+
+  pendingSetupSsid = ssid;
+  pendingSetupPassword = password;
+  pendingSetupConfigUrl = configUrl;
+  setupPortalHasPendingCredentials = true;
+  setupPortalShouldStop = true;
+
+  String successMessage = "Received Wi-Fi details for ";
+  successMessage += ssid;
+  successMessage += ". The setup network will close while the ESP32 connects.";
+  sendSetupPage(successMessage, true);
+}
+
+bool runSetupPortal() {
+  setupPortalShouldStop = false;
+  setupPortalProvisioned = false;
+  setupPortalHasPendingCredentials = false;
+  pendingSetupSsid = "";
+  pendingSetupPassword = "";
+  pendingSetupConfigUrl = "";
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  setupStatusLed();
+  activeSetupApSsid = makeSetupSsid();
+  WiFi.softAPConfig(setupApIp, setupApIp, setupApSubnet);
+
+  if (!WiFi.softAP(activeSetupApSsid.c_str(), setupApPassword)) {
+    Serial.println("Failed to start the LitterSense setup Wi-Fi network.");
+    return false;
+  }
+
+  setupDns.start(SETUP_DNS_PORT, "*", setupApIp);
+
+  setupServer.on("/", HTTP_GET, []() {
+    sendSetupPage();
+  });
+  setupServer.on("/health", HTTP_GET, handleSetupHealth);
+  setupServer.on("/status", HTTP_GET, handleSetupStatus);
+  setupServer.on("/provision", HTTP_OPTIONS, []() {
+    sendSetupCorsHeaders();
+    setupServer.send(204, "text/plain", "");
+  });
+  setupServer.on("/provision", HTTP_POST, handleSetupProvision);
+  setupServer.on("/generate_204", HTTP_GET, redirectToSetupPage);
+  setupServer.on("/hotspot-detect.html", HTTP_GET, redirectToSetupPage);
+  setupServer.onNotFound(redirectToSetupPage);
+  setupServer.begin();
+
+  Serial.println("Setup portal started.");
+  Serial.print("Connect to Wi-Fi: ");
+  Serial.println(activeSetupApSsid);
+  Serial.print("Password: ");
+  Serial.println(setupApPassword);
+  Serial.println("Then open http://192.168.4.1");
+  Serial.print("Setup AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  unsigned long lastPortalStatusMs = 0;
+  while (!setupPortalShouldStop) {
+    setupDns.processNextRequest();
+    setupServer.handleClient();
+    updateSetupPortalIndicator();
+
+    unsigned long now = millis();
+    if (now - lastPortalStatusMs >= 5000UL) {
+      lastPortalStatusMs = now;
+      Serial.print("Setup portal active. Connected clients: ");
+      Serial.println(WiFi.softAPgetStationNum());
+    }
+
+    delay(10);
+  }
+
+  unsigned long closeAt = millis() + 2000;
+  while (millis() < closeAt) {
+    setupDns.processNextRequest();
+    setupServer.handleClient();
+    setStatusLed(true);
+    delay(10);
+  }
+
+  setupServer.stop();
+  setupDns.stop();
+  WiFi.softAPdisconnect(true);
+  activeSetupApSsid = "";
+  setStatusLed(false);
+
+  if (!setupPortalHasPendingCredentials || pendingSetupSsid.length() == 0) {
+    Serial.println("Setup portal closed without Wi-Fi credentials.");
+    return false;
+  }
+
+  String ssid = pendingSetupSsid;
+  String password = pendingSetupPassword;
+  String configUrl = pendingSetupConfigUrl;
+
+  pendingSetupSsid = "";
+  pendingSetupPassword = "";
+  pendingSetupConfigUrl = "";
+  setupPortalHasPendingCredentials = false;
+
+  Serial.print("Connecting after setup portal closed. SSID: ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  delay(300);
+
+  setStatusLed(true);
+  if (!connectWifi(ssid, password, useStaticIpForTargetWifi, "setup")) {
+    setStatusLed(false);
+    Serial.println("Setup Wi-Fi connection failed. Reboot or wait for setup portal retry.");
+    return false;
+  }
+  setStatusLed(false);
+
+  saveWifiConfig(ssid, password);
+  saveDeviceConfigUrl(configUrl);
+
+  if (configUrl.length() > 0) {
+    syncWifiConfigFromCloud(true);
+  }
+
+  setupPortalProvisioned = true;
+  return WiFi.status() == WL_CONNECTED;
 }
 
 bool connectWithStoredOrProvisionedWifi() {
@@ -418,15 +813,16 @@ bool connectWithStoredOrProvisionedWifi() {
   if (loadWifiConfig(savedSsid, savedPassword)) {
     if (connectWifi(savedSsid, savedPassword, useStaticIpForTargetWifi, "saved")) {
       Serial.println("Connected using saved Wi-Fi config.");
+      syncWifiConfigFromCloud(true);
       return true;
     }
 
-    Serial.println("Saved Wi-Fi failed. Trying provisioning refresh.");
+    Serial.println("Saved Wi-Fi failed. Starting owner setup portal.");
   } else {
     Serial.println("No saved Wi-Fi config found.");
   }
 
-  return provisionWifiFromBootstrap();
+  return runSetupPortal();
 }
 
 uint8_t hexPairToByte(const char* text) {
@@ -654,6 +1050,17 @@ void printRfidTag() {
 }
 
 void handleRfidByte(uint8_t value) {
+#if RFID_DEBUG_RAW_BYTES
+  if (xSemaphoreTake(serialMux, portMAX_DELAY)) {
+    Serial.print("RFID RX byte: 0x");
+    if (value < 0x10) {
+      Serial.print('0');
+    }
+    Serial.println(value, HEX);
+    xSemaphoreGive(serialMux);
+  }
+#endif
+
   if (value == 0x02) {
     rfidIndex = 0;
     rfidFrame[rfidIndex++] = value;
@@ -758,6 +1165,8 @@ void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(false);
   delay(1000);
+  setupStatusLed();
+  blinkStatusLed(3, 120);
 
   serialMux = xSemaphoreCreateMutex();
 
@@ -779,12 +1188,20 @@ void setup() {
   Serial.println(digitalRead(MQ136_PIN));
   printProvisioningRequirements();
 
+  bool wifiReady = false;
+  if (forceSetupPortalOnBoot) {
+    Serial.println("Force setup portal is enabled for hardware testing.");
+    wifiReady = runSetupPortal();
+  } else {
+    wifiReady = connectWithStoredOrProvisionedWifi();
+  }
+
   cameraReady = startCamera();
   if (!cameraReady) {
     Serial.println("Camera failed, continuing RFID/gas task only.");
   }
 
-  if (connectWithStoredOrProvisionedWifi()) {
+  if (wifiReady) {
     ensureCameraServerStarted();
   } else {
     Serial.println("Wi-Fi is unavailable. The sketch will keep retrying in loop().");
@@ -811,6 +1228,14 @@ void loop() {
     if (connectWithStoredOrProvisionedWifi()) {
       ensureCameraServerStarted();
     }
+  } else {
+    ensureCameraServerStarted();
+
+    unsigned long now = millis();
+    if (lastCloudConfigSync == 0 || now - lastCloudConfigSync >= CLOUD_CONFIG_SYNC_INTERVAL_MS) {
+      lastCloudConfigSync = now;
+      syncWifiConfigFromCloud(true);
+    }
   }
 
   delay(10000);
@@ -819,12 +1244,23 @@ void loop() {
 void sensorTask(void* pvParameters) {
   unsigned long lastGasCheck = millis() - GAS_REPORT_INTERVAL_MS;
   unsigned long lastRfidWaitingMessage = 0;
+  unsigned long lastRfidNoiseMessage = 0;
 
   while (true) {
     unsigned long now = millis();
+    int rfidBytesThisLoop = 0;
 
-    while (rfid.available()) {
+    while (rfid.available() && rfidBytesThisLoop < RFID_MAX_BYTES_PER_LOOP) {
       handleRfidByte((uint8_t)rfid.read());
+      rfidBytesThisLoop++;
+    }
+
+    if (rfidBytesThisLoop >= RFID_MAX_BYTES_PER_LOOP && now - lastRfidNoiseMessage >= 5000) {
+      lastRfidNoiseMessage = now;
+      if (xSemaphoreTake(serialMux, pdMS_TO_TICKS(10))) {
+        Serial.println("RFID RX is noisy; throttling reads to keep the sensor task responsive.");
+        xSemaphoreGive(serialMux);
+      }
     }
 
     expireRfidSessionIfTimedOut(now);
@@ -832,7 +1268,7 @@ void sensorTask(void* pvParameters) {
     if (now - lastRfidWaitingMessage >= 5000) {
       lastRfidWaitingMessage = now;
       if (xSemaphoreTake(serialMux, portMAX_DELAY)) {
-        Serial.println("RFID ready on GPIO 15. Tap keyfob near antenna.");
+        Serial.println("Scan your cat");
         xSemaphoreGive(serialMux);
       }
     }

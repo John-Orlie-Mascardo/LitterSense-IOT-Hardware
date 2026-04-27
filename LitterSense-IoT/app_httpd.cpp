@@ -38,6 +38,7 @@ extern unsigned long latestSessionEndTime;
 extern unsigned long completedSessionCount;
 extern unsigned long falseEntryCount;
 extern unsigned long noExitTimeoutCount;
+extern SemaphoreHandle_t serialMux;
 extern const int mq135ActiveLevel;
 extern const int mq136ActiveLevel;
 extern const unsigned long normalSessionMinMs;
@@ -1230,22 +1231,47 @@ static esp_err_t sensors_handler(httpd_req_t *req)
 {
     char json_response[1024];
 
-    int mq135Raw = latestMq135;
-    int mq136Raw = latestMq136;
-    String rfidHex = latestRfidHex;
-    String rfidCard = latestRfidCard;
-    unsigned long rfidTime = latestRfidTime;
-    bool sessionActive = rfidSessionActive;
-    String activeHex = activeRfidHex;
-    String activeCard = activeRfidCard;
-    unsigned long sessionStart = activeSessionStartTime;
-    String rfidEvent = latestRfidEvent;
-    String sessionStatus = latestSessionStatus;
-    unsigned long sessionDuration = latestSessionDurationMs;
-    unsigned long sessionEnd = latestSessionEndTime;
-    unsigned long sessionCount = completedSessionCount;
-    unsigned long ignoredFalseEntries = falseEntryCount;
-    unsigned long timeoutCount = noExitTimeoutCount;
+    int mq135Raw = HIGH;
+    int mq136Raw = HIGH;
+    String rfidHex;
+    String rfidCard;
+    unsigned long rfidTime = 0;
+    bool sessionActive = false;
+    String activeHex;
+    String activeCard;
+    unsigned long sessionStart = 0;
+    String rfidEvent;
+    String sessionStatus;
+    unsigned long sessionDuration = 0;
+    unsigned long sessionEnd = 0;
+    unsigned long sessionCount = 0;
+    unsigned long ignoredFalseEntries = 0;
+    unsigned long timeoutCount = 0;
+
+    if (serialMux == NULL || xSemaphoreTake(serialMux, pdMS_TO_TICKS(100)) != pdTRUE) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, "{\"error\":\"sensor snapshot busy\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    mq135Raw = latestMq135;
+    mq136Raw = latestMq136;
+    rfidHex = latestRfidHex;
+    rfidCard = latestRfidCard;
+    rfidTime = latestRfidTime;
+    sessionActive = rfidSessionActive;
+    activeHex = activeRfidHex;
+    activeCard = activeRfidCard;
+    sessionStart = activeSessionStartTime;
+    rfidEvent = latestRfidEvent;
+    sessionStatus = latestSessionStatus;
+    sessionDuration = latestSessionDurationMs;
+    sessionEnd = latestSessionEndTime;
+    sessionCount = completedSessionCount;
+    ignoredFalseEntries = falseEntryCount;
+    timeoutCount = noExitTimeoutCount;
+    xSemaphoreGive(serialMux);
+
     unsigned long activeDuration = sessionActive ? millis() - sessionStart : 0;
     const char* currentSessionStatus = "IDLE";
 
