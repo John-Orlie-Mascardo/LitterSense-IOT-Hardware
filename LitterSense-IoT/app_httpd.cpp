@@ -23,6 +23,10 @@
 
 extern volatile int latestMq135;
 extern volatile int latestMq136;
+extern volatile int latestUltrasonicDistanceMm;
+extern volatile unsigned long latestUltrasonicEchoUs;
+extern volatile unsigned long latestUltrasonicTime;
+extern volatile bool latestUltrasonicWithinLimit;
 extern String latestRfidHex;
 extern String latestRfidCard;
 extern unsigned long latestRfidTime;
@@ -38,12 +42,22 @@ extern unsigned long latestSessionEndTime;
 extern unsigned long completedSessionCount;
 extern unsigned long falseEntryCount;
 extern unsigned long noExitTimeoutCount;
+extern bool sdLoggingReady;
+extern bool sensorSyncUrlConfigured;
+extern unsigned long sdLoggedEventCount;
+extern unsigned long sdSyncedEventCount;
+extern unsigned long sdWriteFailCount;
+extern unsigned long sdSyncFailCount;
 extern SemaphoreHandle_t serialMux;
 extern const int mq135ActiveLevel;
 extern const int mq136ActiveLevel;
 extern const unsigned long normalSessionMinMs;
 extern const unsigned long normalSessionMaxMs;
 extern const unsigned long noExitTimeoutMs;
+extern const int ultrasonicLimitMm;
+extern bool cameraReady;
+
+static const size_t SENSOR_JSON_RESPONSE_CAPACITY = 2048;
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -94,7 +108,7 @@ extern const unsigned long noExitTimeoutMs;
 #endif
 
 // Enable LED FLASH setting
-#define CONFIG_LED_ILLUMINATOR_ENABLED 1
+#define CONFIG_LED_ILLUMINATOR_ENABLED 0
 
 // LED FLASH setup
 #if CONFIG_LED_ILLUMINATOR_ENABLED
@@ -1229,10 +1243,12 @@ static esp_err_t index_handler(httpd_req_t *req)
 
 static esp_err_t sensors_handler(httpd_req_t *req)
 {
-    char json_response[1024];
-
     int mq135Raw = HIGH;
     int mq136Raw = HIGH;
+    int ultrasonicDistanceMm = -1;
+    unsigned long ultrasonicEchoUs = 0;
+    unsigned long ultrasonicTime = 0;
+    bool ultrasonicWithinLimit = false;
     String rfidHex;
     String rfidCard;
     unsigned long rfidTime = 0;
@@ -1247,6 +1263,12 @@ static esp_err_t sensors_handler(httpd_req_t *req)
     unsigned long sessionCount = 0;
     unsigned long ignoredFalseEntries = 0;
     unsigned long timeoutCount = 0;
+    bool offlineLoggingReady = false;
+    bool syncUrlReady = false;
+    unsigned long loggedEvents = 0;
+    unsigned long syncedEvents = 0;
+    unsigned long writeFailures = 0;
+    unsigned long syncFailures = 0;
 
     if (serialMux == NULL || xSemaphoreTake(serialMux, pdMS_TO_TICKS(100)) != pdTRUE) {
         httpd_resp_set_type(req, "application/json");
@@ -1256,6 +1278,10 @@ static esp_err_t sensors_handler(httpd_req_t *req)
 
     mq135Raw = latestMq135;
     mq136Raw = latestMq136;
+    ultrasonicDistanceMm = latestUltrasonicDistanceMm;
+    ultrasonicEchoUs = latestUltrasonicEchoUs;
+    ultrasonicTime = latestUltrasonicTime;
+    ultrasonicWithinLimit = latestUltrasonicWithinLimit;
     rfidHex = latestRfidHex;
     rfidCard = latestRfidCard;
     rfidTime = latestRfidTime;
@@ -1270,6 +1296,12 @@ static esp_err_t sensors_handler(httpd_req_t *req)
     sessionCount = completedSessionCount;
     ignoredFalseEntries = falseEntryCount;
     timeoutCount = noExitTimeoutCount;
+    offlineLoggingReady = sdLoggingReady;
+    syncUrlReady = sensorSyncUrlConfigured;
+    loggedEvents = sdLoggedEventCount;
+    syncedEvents = sdSyncedEventCount;
+    writeFailures = sdWriteFailCount;
+    syncFailures = sdSyncFailCount;
     xSemaphoreGive(serialMux);
 
     unsigned long activeDuration = sessionActive ? millis() - sessionStart : 0;
@@ -1287,14 +1319,27 @@ static esp_err_t sensors_handler(httpd_req_t *req)
         }
     }
 
-    snprintf(
+    char* json_response = (char*)malloc(SENSOR_JSON_RESPONSE_CAPACITY);
+    if (json_response == NULL) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, "{\"error\":\"sensor response allocation failed\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    int jsonLen = snprintf(
         json_response,
-        sizeof(json_response),
+        SENSOR_JSON_RESPONSE_CAPACITY,
         "{"
         "\"mq135\":\"%s\","
         "\"mq136\":\"%s\","
         "\"mq135Raw\":%d,"
         "\"mq136Raw\":%d,"
+        "\"ultrasonicStatus\":\"%s\","
+        "\"ultrasonicDistanceMm\":%d,"
+        "\"ultrasonicLimitMm\":%d,"
+        "\"ultrasonicWithinLimit\":%s,"
+        "\"ultrasonicEchoUs\":%lu,"
+        "\"ultrasonicLastReadMs\":%lu,"
         "\"rfidHex\":\"%s\","
         "\"rfidCard\":\"%s\","
         "\"lastRfidMs\":%lu,"
@@ -1311,12 +1356,24 @@ static esp_err_t sensors_handler(httpd_req_t *req)
         "\"completedSessionCount\":%lu,"
         "\"falseEntryCount\":%lu,"
         "\"noExitTimeoutCount\":%lu,"
-        "\"noExitTimeoutMs\":%lu"
+        "\"noExitTimeoutMs\":%lu,"
+        "\"offlineLoggingReady\":%s,"
+        "\"sensorSyncUrlConfigured\":%s,"
+        "\"sdLoggedEventCount\":%lu,"
+        "\"sdSyncedEventCount\":%lu,"
+        "\"sdWriteFailCount\":%lu,"
+        "\"sdSyncFailCount\":%lu"
         "}",
         mq135Raw == mq135ActiveLevel ? "GAS DETECTED" : "Clear",
         mq136Raw == mq136ActiveLevel ? "GAS DETECTED" : "Clear",
         mq135Raw,
         mq136Raw,
+        ultrasonicDistanceMm >= 0 ? "OK" : "NO_ECHO",
+        ultrasonicDistanceMm,
+        ultrasonicLimitMm,
+        ultrasonicWithinLimit ? "true" : "false",
+        ultrasonicEchoUs,
+        ultrasonicTime,
         rfidHex.c_str(),
         rfidCard.c_str(),
         rfidTime,
@@ -1333,17 +1390,33 @@ static esp_err_t sensors_handler(httpd_req_t *req)
         sessionCount,
         ignoredFalseEntries,
         timeoutCount,
-        noExitTimeoutMs
+        noExitTimeoutMs,
+        offlineLoggingReady ? "true" : "false",
+        syncUrlReady ? "true" : "false",
+        loggedEvents,
+        syncedEvents,
+        writeFailures,
+        syncFailures
     );
+
+    if (jsonLen < 0 || jsonLen >= (int)SENSOR_JSON_RESPONSE_CAPACITY) {
+        free(json_response);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, "{\"error\":\"sensor response too large\"}", HTTPD_RESP_USE_STRLEN);
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_send(req, json_response, strlen(json_response));
+    esp_err_t result = httpd_resp_send(req, json_response, jsonLen);
+    free(json_response);
+    return result;
 }
 
 void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
     config.max_uri_handlers = 16;
 
     httpd_uri_t index_uri = {
@@ -1513,18 +1586,26 @@ void startCameraServer()
     log_i("Starting web server on port: '%d'", config.server_port);
     if (httpd_start(&camera_httpd, &config) == ESP_OK)
     {
-        httpd_register_uri_handler(camera_httpd, &index_uri);
-        httpd_register_uri_handler(camera_httpd, &cmd_uri);
-        httpd_register_uri_handler(camera_httpd, &status_uri);
         httpd_register_uri_handler(camera_httpd, &sensors_uri);
-        httpd_register_uri_handler(camera_httpd, &capture_uri);
-        httpd_register_uri_handler(camera_httpd, &bmp_uri);
+        if (cameraReady) {
+            httpd_register_uri_handler(camera_httpd, &index_uri);
+            httpd_register_uri_handler(camera_httpd, &cmd_uri);
+            httpd_register_uri_handler(camera_httpd, &status_uri);
+            httpd_register_uri_handler(camera_httpd, &capture_uri);
+            httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
-        httpd_register_uri_handler(camera_httpd, &xclk_uri);
-        httpd_register_uri_handler(camera_httpd, &reg_uri);
-        httpd_register_uri_handler(camera_httpd, &greg_uri);
-        httpd_register_uri_handler(camera_httpd, &pll_uri);
-        httpd_register_uri_handler(camera_httpd, &win_uri);
+            httpd_register_uri_handler(camera_httpd, &xclk_uri);
+            httpd_register_uri_handler(camera_httpd, &reg_uri);
+            httpd_register_uri_handler(camera_httpd, &greg_uri);
+            httpd_register_uri_handler(camera_httpd, &pll_uri);
+            httpd_register_uri_handler(camera_httpd, &win_uri);
+        } else {
+            log_i("Camera is unavailable; only /sensors is registered on the web server");
+        }
+    }
+
+    if (!cameraReady) {
+        return;
     }
 
     config.server_port += 1;
