@@ -83,7 +83,7 @@ IPAddress setupApSubnet(255, 255, 255, 0);
 #define MQ135_ACTIVE_LEVEL LOW
 #define MQ136_ACTIVE_LEVEL LOW
 #define GAS_REPORT_INTERVAL_MS 60000UL
-#define ULTRASONIC_REPORT_INTERVAL_MS 5000UL
+#define ULTRASONIC_REPORT_INTERVAL_MS 2000UL
 #define ULTRASONIC_ECHO_TIMEOUT_US 30000UL
 #define ULTRASONIC_LIMIT_MM 300
 #define SENSOR_SYNC_INTERVAL_MS 30000UL
@@ -95,14 +95,14 @@ IPAddress setupApSubnet(255, 255, 255, 0);
 #define SENSOR_SYNC_NO_PENDING 0
 #define SENSOR_SYNC_SUCCESS 1
 #define SENSOR_SYNC_FAILED 2
-#define RFID_PASS_DEBOUNCE_MS 5000UL
+#define RFID_PASS_DEBOUNCE_MS 2000UL
 #define RFID_MAX_BYTES_PER_LOOP 32
 #define RFID_DEBUG_RAW_BYTES false
-#define FALSE_ENTER_MAX_MS 30000UL
+#define FALSE_ENTER_MAX_MS 8000UL
 #define NORMAL_SESSION_MIN_MS 120000UL
 #define NORMAL_SESSION_MAX_MS 180000UL
 #define NO_EXIT_TIMEOUT_MS 900000UL
-#define RFID_ENTRY_CONFIRMATION_WINDOW_MS 10000UL
+#define RFID_ENTRY_CONFIRMATION_WINDOW_MS 15000UL
 
 // ESP32-CAM SD_MMC pins overlap this live sensor map, so offline replay uses onboard flash.
 const bool enableFlashOfflineLogging = true;
@@ -459,6 +459,68 @@ void requestSensorSyncIfOnline() {
   }
 }
 
+bool postSingleSensorEvent(const char* eventJson) {
+  if (eventJson == NULL || eventJson[0] == '\0' || WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  if (!sensorSyncUrlConfigured && !configureSensorSyncUrl()) {
+    return false;
+  }
+
+  char body[SYNC_BODY_MAX_LEN];
+  int bodyLen = snprintf(
+    body,
+    sizeof(body),
+    "{\"deviceId\":\"%s\",\"events\":[%s]}",
+    deviceId,
+    eventJson
+  );
+
+  if (bodyLen <= 0 || bodyLen >= (int)sizeof(body)) {
+    return false;
+  }
+
+  HTTPClient http;
+  WiFiClient plainClient;
+  WiFiClientSecure secureClient;
+  bool began = false;
+
+  if (strncmp(sensorSyncUrl, "https://", 8) == 0) {
+    secureClient.setInsecure();
+    began = http.begin(secureClient, sensorSyncUrl);
+  } else {
+    began = http.begin(plainClient, sensorSyncUrl);
+  }
+
+  if (!began) {
+    return false;
+  }
+
+  http.setConnectTimeout(SYNC_HTTP_TIMEOUT_MS);
+  http.setTimeout(SYNC_HTTP_TIMEOUT_MS);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST((uint8_t*)body, (size_t)bodyLen);
+  String responseBody = http.getString();
+  http.end();
+
+  if (code == HTTP_CODE_OK) {
+    return true;
+  }
+
+  if (xSemaphoreTake(serialMux, pdMS_TO_TICKS(100))) {
+    Serial.print("Immediate sensor sync failed. HTTP ");
+    Serial.println(code);
+    if (responseBody.length() > 0) {
+      Serial.println(responseBody);
+    }
+    xSemaphoreGive(serialMux);
+  }
+
+  return false;
+}
+
 bool appendJsonLineToSd(const char* jsonLine) {
   if (jsonLine == NULL || jsonLine[0] == '\0') {
     return false;
@@ -466,6 +528,10 @@ bool appendJsonLineToSd(const char* jsonLine) {
 
   if (!enableFlashOfflineLogging) {
     return false;
+  }
+
+  if (WiFi.status() == WL_CONNECTED && postSingleSensorEvent(jsonLine)) {
+    return true;
   }
 
   if (!beginSdTransaction(true)) {
@@ -695,7 +761,18 @@ bool postEventBatch(const char* eventsJson, int eventCount) {
   }
 
   HTTPClient http;
-  if (!http.begin(sensorSyncUrl)) {
+  WiFiClient plainClient;
+  WiFiClientSecure secureClient;
+  bool began = false;
+
+  if (strncmp(sensorSyncUrl, "https://", 8) == 0) {
+    secureClient.setInsecure();
+    began = http.begin(secureClient, sensorSyncUrl);
+  } else {
+    began = http.begin(plainClient, sensorSyncUrl);
+  }
+
+  if (!began) {
     return false;
   }
 
@@ -1615,7 +1692,9 @@ void startPendingRfidEntryLocked(
   latestSessionStartTime = 0;
   latestSessionEndTime = 0;
 
-  Serial.println("RFID pending: waiting for ultrasonic confirmation within 10s.");
+  Serial.print("RFID pending: waiting for ultrasonic confirmation within ");
+  Serial.print(RFID_ENTRY_CONFIRMATION_WINDOW_MS / 1000UL);
+  Serial.println("s.");
   Serial.print("Pending card: ");
   Serial.println(pendingRfidCard);
 }
@@ -1975,8 +2054,8 @@ bool startCamera() {
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_QVGA;
-    config.jpeg_quality = 10;
+    config.frame_size = FRAMESIZE_QQVGA;
+    config.jpeg_quality = 15;
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_PSRAM;
   } else {

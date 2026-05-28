@@ -128,8 +128,9 @@ test("offline sync keeps large JSON buffers off the loop task stack", () => {
   assert.match(syncLoggedEventsBatch, /postEventBatch\s*\(\s*syncEventsJson\s*,\s*eventCount\s*\)/);
 });
 
-test("RFID entry requires ultrasonic confirmation within 10 seconds", () => {
-  assert.match(litterSenseSketch, /#define\s+RFID_ENTRY_CONFIRMATION_WINDOW_MS\s+10000UL/);
+test("RFID entry allows realistic confirmation but rejects very short false entries", () => {
+  assert.match(litterSenseSketch, /#define\s+RFID_ENTRY_CONFIRMATION_WINDOW_MS\s+15000UL/);
+  assert.match(litterSenseSketch, /#define\s+FALSE_ENTER_MAX_MS\s+8000UL/);
   assert.match(litterSenseSketch, /bool\s+pendingRfidEntry\s*=\s*false\s*;/);
 
   const updateRfidSessionLocked = functionBodyFrom(
